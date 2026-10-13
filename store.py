@@ -25,6 +25,9 @@ class MemoryStore:
         raw = self._data.get(key)
         return json.loads(raw) if raw else None
 
+    def mget(self, keys: list[str]) -> list[Optional[dict]]:
+        return [self.get(k) for k in keys]
+
     def set(self, key: str, value: dict) -> None:
         self._data[key] = json.dumps(value)
 
@@ -72,6 +75,14 @@ class UpstashStore:
     def get(self, key: str) -> Optional[dict]:
         raw = self._cmd("GET", key)
         return json.loads(raw) if raw else None
+
+    def mget(self, keys: list[str]) -> list[Optional[dict]]:
+        """طلب واحد لعدة مفاتيح (أسرع بكثير من GET لكل ترخيص)."""
+        out: list[Optional[dict]] = []
+        for i in range(0, len(keys), 200):
+            raws = self._cmd("MGET", *keys[i:i + 200]) or []
+            out += [json.loads(r) if r else None for r in raws]
+        return out
 
     def set(self, key: str, value: dict) -> None:
         self._cmd("SET", key, json.dumps(value))
