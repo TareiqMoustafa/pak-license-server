@@ -138,6 +138,10 @@ def verify():
     patch_url = os.environ.get("PATCH_URL")
     if patch_url:
         extra["download_url"] = patch_url
+    # اسم ملف الباتش وحزمة اللعبة (تتغيران مع تحديثات اللعبة والمناطق) بدون إعادة بناء التطبيق
+    for env_name, field in (("PATCH_FILE_NAME", "target_file_name"), ("GAME_PACKAGE", "game_package")):
+        if os.environ.get(env_name):
+            extra[field] = os.environ[env_name]
     return reply("active", f"مفعّل! المتبقي {remaining.days} يوم و{remaining.seconds // 3600} ساعة.", **extra)
 
 
