@@ -1,16 +1,15 @@
 """سيرفر التراخيص - Flask على Vercel."""
 from __future__ import annotations
 
-import hashlib
+import hmac
 import logging
-import os
-import re
-import secrets
-from datetime import datetime, timedelta, timezone
 
 from flask import Flask, jsonify, make_response, request
 
+import core
+import telegram_bot as tg
 from admin_page import ADMIN_HTML
+from core import DEVICE_RE, KEY_RE, LicenseError, hash_key, iso, normalize, parse, utcnow
 from security import admin_required, client_ip, rate_limit
 from store import get_store
 
@@ -21,70 +20,15 @@ app.config["MAX_CONTENT_LENGTH"] = 16 * 1024
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("license")
 
-DURATIONS = {"week": 7, "month": 30, "2.5months": 75}
-KEY_RE = re.compile(r"^[A-Z0-9][A-Z0-9_-]{5,63}$")
-DEVICE_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
-INDEX = "licenses"
-ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # بدون أحرف متشابهة (0/O, 1/I)
-
-
-# ------------------------------------------------------------ أدوات
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def iso(dt: datetime) -> str:
-    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def parse(ts: str) -> datetime:
-    return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-
-
-def hash_key(key: str) -> str:
-    """نخزّن بصمة الكود فقط؛ لا يُحفظ الكود الأصلي أبداً."""
-    pepper = os.environ.get("KEY_PEPPER", "")
-    return hashlib.sha256(f"{pepper}{key}".encode()).hexdigest()
-
-
-def normalize(key: str) -> str:
-    return str(key or "").strip().upper()
-
-
-def generate_key() -> str:
-    return "VIP-" + "-".join("".join(secrets.choice(ALPHABET) for _ in range(4)) for _ in range(3))
-
 
 def reply(status: str, message: str, code: int = 200, **extra):
-    return jsonify(status=status, message=message, **extra), code
+    resp = jsonify(status=status, message=message, **extra)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp, code
 
 
-def find_hash(data: dict) -> str | None:
-    """يحدد الترخيص بواسطة key أو id (أول 12 خانة من البصمة)."""
-    if data.get("key"):
-        return hash_key(normalize(data["key"]))
-    lic_id = str(data.get("id", "")).lower()
-    if len(lic_id) >= 8:
-        for h in get_store().smembers(INDEX):
-            if h.startswith(lic_id):
-                return h
-    return None
-
-
-def public_view(h: str, lic: dict) -> dict:
-    expired = parse(lic["expiry"]) <= utcnow()
-    return {
-        "id": h[:12],
-        "type": lic["type"],
-        "status": "expired" if expired and lic["status"] == "active" else lic["status"],
-        "expires_at": lic["expiry"],
-        "created": lic.get("created"),
-        "devices": len(lic["devices"]),
-        "max_devices": lic["max_devices"],
-        "checks": lic.get("checks", 0),
-        "last_seen": lic.get("last_seen"),
-        "note": lic.get("note", ""),
-    }
+def fail(ex: LicenseError):
+    return jsonify(success=False, message=ex.message), ex.status
 
 
 # ------------------------------------------------------------ عام
@@ -92,6 +36,18 @@ def public_view(h: str, lic: dict) -> dict:
 @app.get("/api/health")
 def health():
     return jsonify(ok=True, storage=get_store().kind, time=iso(utcnow()))
+
+
+@app.get("/api/app-config")
+def app_config():
+    """معلومات عامة للتطبيق قبل إدخال الكود (بدون رابط الباتش)."""
+    s = core.get_settings()
+    resp = jsonify(
+        maintenance=s["maintenance"], notice=s["notice"], support_url=s["support_url"],
+        min_app_version=s["min_app_version"], update_url=s["update_url"], patch_version=s["patch_version"],
+    )
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.post("/api/verify")
@@ -102,8 +58,17 @@ def verify():
     data = request.get_json(silent=True) or {}
     key = normalize(data.get("key"))
     device = str(data.get("device_id", "")).strip()
+    app_version = str(data.get("app_version", "")).strip()[:20]
     if not KEY_RE.match(key) or not DEVICE_RE.match(device):
         return reply("invalid", "بيانات غير صالحة.", 400)
+
+    settings = core.get_settings()
+    if settings["maintenance"]:
+        return reply("maintenance", settings["notice"] or "السيرفر تحت الصيانة، حاول لاحقاً.", 503)
+    min_ver = settings["min_app_version"]
+    if min_ver and core.ver_tuple(app_version or "0") < core.ver_tuple(min_ver):
+        return reply("update_required", "يجب تحديث التطبيق للمتابعة.", 426,
+                     update_url=settings["update_url"], min_app_version=min_ver)
 
     db = get_store()
     h = hash_key(key)
@@ -120,30 +85,44 @@ def verify():
     if now >= expiry:
         return reply("expired", "انتهى الاشتراك، يرجى التجديد.", 403)
 
+    new_device = False
     if device not in lic["devices"]:
         if len(lic["devices"]) >= lic["max_devices"]:
             return reply("device_limit", "هذا الكود مرتبط بجهاز آخر. تواصل مع الدعم لإعادة الضبط.", 403)
         lic["devices"].append(device)
+        new_device = True
 
     lic["checks"] = lic.get("checks", 0) + 1
     lic["last_seen"] = iso(now)
     db.set(f"lic:{h}", lic)
 
+    if new_device:
+        tg.notify(f"🔔 تفعيل جديد\n<code>{h[:12]}</code> • {tg._esc(lic['type'])}"
+                  + (f" • {tg._esc(lic['note'])}" if lic.get("note") else "")
+                  + f"\nالأجهزة {len(lic['devices'])}/{lic['max_devices']}")
+
     remaining = expiry - now
+    try:
+        total_days = max(1, (expiry - parse(lic["created"])).days)
+    except (KeyError, TypeError, ValueError):
+        total_days = max(1, remaining.days)
+
     extra = {
         "type": lic["type"],
         "expires_at": lic["expiry"],
         "remaining_days": remaining.days,
         "remaining_hours": remaining.seconds // 3600,
+        "total_days": total_days,
+        "patch_version": settings["patch_version"],
+        "force_update": settings["force_patch_update"],
+        "notice": settings["notice"],
+        "support_url": settings["support_url"],
     }
-    # رابط الباتش يُرسل فقط للأكواد الصالحة (يُضبط من متغير بيئة)
-    patch_url = os.environ.get("PATCH_URL")
-    if patch_url:
-        extra["download_url"] = patch_url
-    # اسم ملف الباتش وحزمة اللعبة (تتغيران مع تحديثات اللعبة والمناطق) بدون إعادة بناء التطبيق
-    for env_name, field in (("PATCH_FILE_NAME", "target_file_name"), ("GAME_PACKAGE", "game_package")):
-        if os.environ.get(env_name):
-            extra[field] = os.environ[env_name]
+    # رابط الباتش وبياناته تُرسل فقط للأكواد الصالحة
+    for field in ("patch_url", "patch_file_name", "game_package"):
+        if settings[field]:
+            extra[{"patch_url": "download_url", "patch_file_name": "target_file_name",
+                   "game_package": "game_package"}[field]] = settings[field]
     return reply("active", f"مفعّل! المتبقي {remaining.days} يوم و{remaining.seconds // 3600} ساعة.", **extra)
 
 
@@ -157,7 +136,8 @@ def admin_page():
     resp.headers["X-Frame-Options"] = "DENY"
     resp.headers["Referrer-Policy"] = "no-referrer"
     resp.headers["Content-Security-Policy"] = (
-        "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+        "default-src 'none'; script-src 'unsafe-inline'; "
+        "style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; "
         "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
     )
     return resp
@@ -167,100 +147,72 @@ def admin_page():
 @app.post("/api/admin/add")
 @admin_required
 def admin_add():
-    data = request.get_json(silent=True) or {}
-    dtype = str(data.get("type", "week"))
-    days = DURATIONS.get(dtype)
-    if days is None:
-        try:
-            days = int(data.get("days", 0))
-        except (TypeError, ValueError):
-            days = 0
-        if not 1 <= days <= 3650:
-            return jsonify(success=False, message=f"type غير معروف. المتاح: {', '.join(DURATIONS)} أو days (1-3650)."), 400
-        dtype = f"{days}days"
-
     try:
-        count = int(data.get("count", 1))
-        max_devices = int(data.get("max_devices", 1))
-    except (TypeError, ValueError):
-        return jsonify(success=False, message="count/max_devices يجب أن تكون أرقاماً."), 400
-    if not (1 <= count <= 50 and 1 <= max_devices <= 10):
-        return jsonify(success=False, message="count (1-50) و max_devices (1-10)."), 400
-
-    custom = normalize(data.get("key")) if data.get("key") else None
-    if custom and (count != 1 or not KEY_RE.match(custom)):
-        return jsonify(success=False, message="الكود المخصص: واحد فقط، 6-64 حرفاً (A-Z 0-9 - _)."), 400
-
-    db = get_store()
-    expiry = iso(utcnow() + timedelta(days=days))
-    created = []
-    for _ in range(count):
-        key = custom or generate_key()
-        h = hash_key(key)
-        if db.get(f"lic:{h}"):
-            if custom:
-                return jsonify(success=False, message="هذا الكود موجود مسبقاً."), 409
-            continue
-        db.set(f"lic:{h}", {
-            "type": dtype, "status": "active", "expiry": expiry, "created": iso(utcnow()),
-            "devices": [], "max_devices": max_devices, "checks": 0,
-            "last_seen": None, "note": str(data.get("note", ""))[:100],
-        })
-        db.sadd(INDEX, h)
-        created.append({"key": key, "id": h[:12], "expires_at": expiry})
-    return jsonify(success=True, message=f"تم إنشاء {len(created)} كود. احفظها الآن؛ لن تظهر مرة أخرى.", keys=created)
+        created = core.create_licenses(request.get_json(silent=True) or {})
+    except LicenseError as ex:
+        return fail(ex)
+    return jsonify(success=True, message=f"تم إنشاء {len(created)} كود. احفظها الآن؛ لن تظهر مرة أخرى.",
+                   keys=created)
 
 
 @app.get("/api/admin/list")
 @admin_required
 def admin_list():
-    db = get_store()
-    rows = []
-    for h in db.smembers(INDEX)[:500]:
-        lic = db.get(f"lic:{h}")
-        if lic:
-            rows.append(public_view(h, lic))
+    rows = core.list_licenses()
     return jsonify(success=True, count=len(rows), licenses=rows)
 
 
 @app.post("/api/admin/control")
 @admin_required
 def admin_control():
-    data = request.get_json(silent=True) or {}
-    action = str(data.get("action", "")).lower()
-    action = {"block": "ban", "unblock": "unban"}.get(action, action)
-    if action not in {"ban", "unban", "reset_devices", "extend", "delete"}:
-        return jsonify(success=False, message="action: ban | unban | reset_devices | extend | delete"), 400
+    try:
+        message, view = core.control_license(request.get_json(silent=True) or {})
+    except LicenseError as ex:
+        return fail(ex)
+    return jsonify(success=True, message=message, license=view)
 
-    h = find_hash(data)
-    db = get_store()
-    lic = db.get(f"lic:{h}") if h else None
-    if not lic:
-        return jsonify(success=False, message="الترخيص غير موجود."), 404
 
-    if action == "delete":
-        db.delete(f"lic:{h}")
-        db.srem(INDEX, h)
-        return jsonify(success=True, message="تم الحذف.")
+@app.get("/api/admin/settings")
+@admin_required
+def admin_settings_get():
+    return jsonify(success=True, settings=core.get_settings(),
+                   telegram={"configured": tg.configured(), "admins": len(tg.admin_ids())})
 
-    if action == "ban":
-        lic["status"] = "banned"
-    elif action == "unban":
-        lic["status"] = "active"
-    elif action == "reset_devices":
-        lic["devices"] = []
-    elif action == "extend":
-        try:
-            days = int(data.get("days", 0))
-        except (TypeError, ValueError):
-            days = 0
-        if not 1 <= days <= 3650:
-            return jsonify(success=False, message="days (1-3650)."), 400
-        base = max(parse(lic["expiry"]), utcnow())  # التمديد من الآن إن كان منتهياً
-        lic["expiry"] = iso(base + timedelta(days=days))
 
-    db.set(f"lic:{h}", lic)
-    return jsonify(success=True, message=f"تم تنفيذ {action}.", license=public_view(h, lic))
+@app.post("/api/admin/settings")
+@admin_required
+def admin_settings_set():
+    try:
+        settings = core.save_settings(request.get_json(silent=True) or {})
+    except LicenseError as ex:
+        return fail(ex)
+    return jsonify(success=True, message="تم حفظ الإعدادات.", settings=settings)
+
+
+@app.post("/api/admin/telegram/setup")
+@admin_required
+def admin_telegram_setup():
+    try:
+        ok, message = tg.setup_webhook(request.host)
+    except Exception as ex:  # noqa: BLE001
+        log.exception("telegram setup failed")
+        return jsonify(success=False, message=f"تعذر الاتصال بتيليجرام: {ex.__class__.__name__}"), 502
+    return jsonify(success=ok, message=message), (200 if ok else 400)
+
+
+# ------------------------------------------------------------ تيليجرام
+@app.post("/api/telegram/webhook")
+def telegram_webhook():
+    if not tg.configured():
+        return "", 404
+    sent = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not hmac.compare_digest(sent.encode(), tg.webhook_secret().encode()):
+        return "", 403
+    try:
+        tg.handle_update(request.get_json(silent=True) or {})
+    except Exception:  # noqa: BLE001  (نرد 200 دائماً كي لا يعيد تيليجرام الإرسال)
+        log.exception("telegram update failed")
+    return "", 200
 
 
 # ------------------------------------------------------------ أخطاء JSON
