@@ -8,8 +8,9 @@ import re
 import secrets
 from datetime import datetime, timedelta, timezone
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, make_response, request
 
+from admin_page import ADMIN_HTML
 from security import admin_required, client_ip, rate_limit
 from store import get_store
 
@@ -77,6 +78,7 @@ def public_view(h: str, lic: dict) -> dict:
         "type": lic["type"],
         "status": "expired" if expired and lic["status"] == "active" else lic["status"],
         "expires_at": lic["expiry"],
+        "created": lic.get("created"),
         "devices": len(lic["devices"]),
         "max_devices": lic["max_devices"],
         "checks": lic.get("checks", 0),
@@ -143,6 +145,22 @@ def verify():
         if os.environ.get(env_name):
             extra[field] = os.environ[env_name]
     return reply("active", f"مفعّل! المتبقي {remaining.days} يوم و{remaining.seconds // 3600} ساعة.", **extra)
+
+
+# ------------------------------------------------------------ لوحة التحكم (واجهة فقط؛ الحماية في الـ API)
+@app.get("/admin")
+def admin_page():
+    resp = make_response(ADMIN_HTML)
+    resp.headers["Content-Type"] = "text/html; charset=utf-8"
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["X-Robots-Tag"] = "noindex, nofollow"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+        "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    )
+    return resp
 
 
 # ------------------------------------------------------------ الأدمن
