@@ -344,6 +344,15 @@ code{direction:ltr;unicode-bidi:isolate;background:#050711;border:1px solid var(
             <input id="f_patch_file_name" data-k="patch_file_name" type="text" class="ltr" placeholder="اتركه فارغاً للاسم الافتراضي">
           </div>
           <div class="full">
+            <label for="f_patch_notes">ما الجديد في هذا الباتش (يظهر في التطبيق)</label>
+            <textarea id="f_patch_notes" data-k="patch_notes" maxlength="600" placeholder="مثال: تحسين الحماية وإصلاح أخطاء."></textarea>
+          </div>
+          <div class="full">
+            <label for="f_patch_sha256">بصمة SHA-256 للملف (اختياري)</label>
+            <input id="f_patch_sha256" data-k="patch_sha256" type="text" class="ltr" placeholder="64 خانة" autocomplete="off">
+            <p class="hint">إن وضعتها يتحقق التطبيق من سلامة الملف قبل التثبيت ويرفض أي ملف تالف. احسبها بالأمر: <code>sha256sum file.pak</code></p>
+          </div>
+          <div class="full">
             <label for="f_game_package">حزمة اللعبة</label>
             <input id="f_game_package" data-k="game_package" type="text" class="ltr" placeholder="com.tencent.ig">
           </div>
@@ -563,6 +572,7 @@ function card(r,key){
     h('div',{class:'acts'},
       key&&act('نسخ الكود','btn-main',()=>copy(key)),
       key&&act('نسخ رسالة للعميل','',()=>copy(`كود التفعيل: ${key}\nصالح حتى: ${fmtDate(r.expires_at)}`)),
+      !key&&r.recoverable&&act('إظهار الكود','btn-main',()=>reveal(r)),
       !key&&act('نسخ المعرّف','',()=>copy(r.id)),
       act('تمديد','',()=>extend(r)),
       act('إعادة ضبط الجهاز','',()=>control(r,'reset_devices',{},'إعادة ضبط الجهاز','سيتمكن العميل من تفعيل الكود على جهاز جديد.')),
@@ -578,6 +588,15 @@ async function control(r,action,extra={},title,body,danger){
     const d=await api('/api/admin/control','POST',{id:r.id,action,...extra});toast(d.message||'تم');
     if(action==='delete'){const v=vault();delete v[r.id];saveVault(v);openId=null;}
     await load();
+  }catch(e){quiet(e);}
+}
+async function reveal(r){
+  try{
+    const d=await api('/api/admin/reveal','POST',{id:r.id});
+    const v=vault();v[r.id]=d.key;saveVault(v);
+    const el=h('div',{class:'id',style:'font-size:17px;margin:12px 0 0'},d.key);
+    if(await ask({title:'كود العميل',body:r.note||null,ok:'نسخ',content:{el,value:()=>true,focus:()=>{}}}))copy(d.key);
+    render();
   }catch(e){quiet(e);}
 }
 async function extend(r){
