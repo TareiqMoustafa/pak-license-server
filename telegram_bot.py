@@ -30,6 +30,7 @@ HELP = """<b>أوامر الإدارة</b>
   المدد: week | month | 2.5months | رقم أيام (مثل 45)
 /list  أو  /list active|expired|banned
 /info ID
+/key ID  ← إظهار الكود الأصلي (للأكواد المحفوظة مشفّرة)
 /extend ID 30
 /reset ID  ← إعادة ضبط الجهاز
 /ban ID  ·  /unban ID
@@ -190,6 +191,12 @@ def cmd_info(args: list[str]) -> str:
             f"عدد التحققات: {r['checks']}\nآخر ظهور: {seen}")
 
 
+def cmd_key(args: list[str]) -> str:
+    if not args:
+        return "الاستخدام: /key ID"
+    return f"🔑 <code>{_esc(core.reveal_key({'id': args[0]}))}</code>\nاحذف الرسالة بعد النسخ."
+
+
 def cmd_stats(_: list[str]) -> str:
     rows = core.list_licenses()
     c = {"active": 0, "expired": 0, "banned": 0}
@@ -250,7 +257,7 @@ def run_command(text: str) -> str:
     cmd = parts[0].lstrip("/").split("@")[0].lower()
     args = parts[1:]
     table = {
-        "add": lambda: cmd_add(args), "list": lambda: cmd_list(args), "info": lambda: cmd_info(args),
+        "add": lambda: cmd_add(args), "list": lambda: cmd_list(args), "info": lambda: cmd_info(args), "key": lambda: cmd_key(args),
         "stats": lambda: cmd_stats(args), "settings": lambda: cmd_settings(args),
         "ban": lambda: cmd_control("ban", args), "unban": lambda: cmd_control("unban", args),
         "reset": lambda: cmd_control("reset_devices", args), "extend": lambda: cmd_control("extend", args),
