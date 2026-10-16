@@ -1,6 +1,7 @@
 """منطق التراخيص والإعدادات (يستخدمه الـ API وبوت تيليجرام معاً)."""
 from __future__ import annotations
 
+import base64
 import hashlib
 import os
 import re
@@ -82,8 +83,39 @@ def public_view(h: str, lic: dict) -> dict:
         "checks": lic.get("checks", 0),
         "last_seen": lic.get("last_seen"),
         "note": lic.get("note", ""),
+        "recoverable": bool(lic.get("enc")),
     }
 
+
+
+# ------------------------------------------------------------ حفظ مشفّر للأكواد (اختياري)
+def _fernet():
+    """يعمل فقط إذا ضُبط KEY_VAULT_SECRET في Vercel (24 حرفاً فأكثر)؛ وإلا لا يُحفظ أي شيء قابل للاسترجاع."""
+    secret = os.environ.get("KEY_VAULT_SECRET", "")
+    if len(secret) < 24:
+        return None
+    from cryptography.fernet import Fernet
+    return Fernet(base64.urlsafe_b64encode(hashlib.sha256(f"vault:{secret}".encode()).digest()))
+
+
+def vault_enabled() -> bool:
+    return _fernet() is not None
+
+
+def reveal_key(data: dict) -> str:
+    h = find_hash(data)
+    lic = get_store().get(f"lic:{h}") if h else None
+    if not lic:
+        raise LicenseError("الترخيص غير موجود.", 404)
+    f = _fernet()
+    if not lic.get("enc"):
+        raise LicenseError("هذا الكود أُنشئ قبل تفعيل الحفظ المشفّر، ولا يمكن استرجاعه.", 410)
+    if f is None:
+        raise LicenseError("KEY_VAULT_SECRET غير مضبوط في Vercel.", 503)
+    try:
+        return f.decrypt(lic["enc"].encode()).decode()
+    except Exception:
+        raise LicenseError("تعذر فك التشفير (هل تغيّر KEY_VAULT_SECRET؟).", 500)
 
 # ------------------------------------------------------------ التراخيص
 def create_licenses(data: dict) -> list[dict]:
@@ -111,6 +143,7 @@ def create_licenses(data: dict) -> list[dict]:
         raise LicenseError("الكود المخصص: واحد فقط، 6-64 حرفاً (A-Z 0-9 - _).")
 
     db = get_store()
+    vault = _fernet()
     now = utcnow()
     expiry = iso(now + timedelta(days=days))
     created: list[dict] = []
@@ -121,11 +154,14 @@ def create_licenses(data: dict) -> list[dict]:
             if custom:
                 raise LicenseError("هذا الكود موجود مسبقاً.", 409)
             continue
-        db.set(f"lic:{h}", {
+        record = {
             "type": dtype, "status": "active", "expiry": expiry, "created": iso(now),
             "devices": [], "max_devices": max_devices, "checks": 0,
             "last_seen": None, "note": str(data.get("note", ""))[:100],
-        })
+        }
+        if vault:
+            record["enc"] = vault.encrypt(key.encode()).decode()
+        db.set(f"lic:{h}", record)
         db.sadd(INDEX, h)
         created.append({"key": key, "id": h[:12], "expires_at": expiry})
     return created
@@ -191,6 +227,8 @@ DEFAULTS: dict = {
     "patch_file_name": "",       # اسم الملف داخل مجلد اللعبة (.pak)
     "game_package": "",          # حزمة اللعبة (مثل com.tencent.ig)
     "patch_version": "1",        # غيّر الرقم عند كل باتش جديد ليعرف التطبيق أن هناك تحديثاً
+    "patch_sha256": "",          # بصمة SHA-256 للملف (اختياري) ليتحقق التطبيق من سلامته
+    "patch_notes": "",           # ما الجديد في هذا الباتش (يظهر في التطبيق)
     "force_patch_update": False,  # تحديث الباتش تلقائياً وإلزامياً
     "min_app_version": "",       # أقل نسخة تطبيق مسموحة (أي نسخة أقدم تُمنع وتُطلب منها التحديث)
     "update_url": "",            # رابط تحميل APK الجديد
@@ -244,6 +282,10 @@ def validate_settings(data: dict) -> dict:
             raise LicenseError("نسخة التطبيق بالشكل 1.3.0")
         elif field == "notice" and len(value) > 300:
             raise LicenseError("الإعلان أطول من 300 حرف.")
+        elif field == "patch_notes" and len(value) > 600:
+            raise LicenseError("ملاحظات الباتش أطول من 600 حرف.")
+        elif field == "patch_sha256" and value and not re.fullmatch(r"[A-Fa-f0-9]{64}", value):
+            raise LicenseError("بصمة SHA-256 يجب أن تكون 64 خانة (0-9 و a-f).")
         clean[field] = value
     return clean
 
