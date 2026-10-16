@@ -7,10 +7,12 @@ import logging
 from flask import Flask, jsonify, make_response, request
 
 import core
+import iplog
 import telegram_bot as tg
 from admin_page import ADMIN_HTML
+from owner_page import OWNER_HTML
 from core import DEVICE_RE, KEY_RE, LicenseError, hash_key, iso, normalize, parse, utcnow
-from security import admin_required, client_ip, rate_limit
+from security import admin_required, client_ip, owner_required, rate_limit, user_agent
 from store import get_store
 
 app = Flask(__name__)
@@ -73,21 +75,29 @@ def verify():
     db = get_store()
     h = hash_key(key)
     lic = db.get(f"lic:{h}")
+    ip, ua = client_ip(), user_agent()
     if not lic:
-        log.info("verify invalid ip=%s", client_ip())
+        log.info("verify invalid ip=%s", ip)
+        iplog.record("invalid", "", ip, ua, dev=device[:8])
         return reply("invalid", "الكود غير صحيح.", 404)
 
+    def seen(status: str) -> None:
+        iplog.record("user", h[:12], ip, ua, note=lic.get("note", ""), status=status, dev=device[:8])
+
     if lic["status"] == "banned":
+        seen("banned")
         return reply("banned", "هذا الكود محظور.", 403)
 
     expiry = parse(lic["expiry"])
     now = utcnow()
     if now >= expiry:
+        seen("expired")
         return reply("expired", "انتهى الاشتراك، يرجى التجديد.", 403)
 
     new_device = False
     if device not in lic["devices"]:
         if len(lic["devices"]) >= lic["max_devices"]:
+            seen("device_limit")
             return reply("device_limit", "هذا الكود مرتبط بجهاز آخر. تواصل مع الدعم لإعادة الضبط.", 403)
         lic["devices"].append(device)
         new_device = True
@@ -96,6 +106,7 @@ def verify():
     lic["last_seen"] = iso(now)
     db.set(f"lic:{h}", lic)
 
+    seen("active")
     if new_device:
         tg.notify(f"🔔 تفعيل جديد\n<code>{h[:12]}</code> • {tg._esc(lic['type'])}"
                   + (f" • {tg._esc(lic['note'])}" if lic.get("note") else "")
@@ -117,6 +128,8 @@ def verify():
         "force_update": settings["force_patch_update"],
         "notice": settings["notice"],
         "support_url": settings["support_url"],
+        "patch_sha256": settings["patch_sha256"],
+        "patch_notes": settings["patch_notes"],
     }
     # رابط الباتش وبياناته تُرسل فقط للأكواد الصالحة
     for field in ("patch_url", "patch_file_name", "game_package"):
@@ -172,11 +185,25 @@ def admin_control():
     return jsonify(success=True, message=message, license=view)
 
 
+@app.post("/api/admin/reveal")
+@admin_required
+def admin_reveal():
+    try:
+        key = core.reveal_key(request.get_json(silent=True) or {})
+    except LicenseError as ex:
+        return fail(ex)
+    log.info("admin revealed a key ip=%s", client_ip())
+    resp = jsonify(success=True, key=key)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
 @app.get("/api/admin/settings")
 @admin_required
 def admin_settings_get():
     return jsonify(success=True, settings=core.get_settings(),
-                   telegram={"configured": tg.configured(), "admins": len(tg.admin_ids())})
+                   telegram={"configured": tg.configured(), "admins": len(tg.admin_ids())},
+                   vault=core.vault_enabled())
 
 
 @app.post("/api/admin/settings")
@@ -198,6 +225,35 @@ def admin_telegram_setup():
         log.exception("telegram setup failed")
         return jsonify(success=False, message=f"تعذر الاتصال بتيليجرام: {ex.__class__.__name__}"), 502
     return jsonify(success=ok, message=message), (200 if ok else 400)
+
+
+# ------------------------------------------------------------ المالك فقط (سجل IP)
+@app.get("/owner")
+def owner_page():
+    resp = make_response(OWNER_HTML)
+    resp.headers["Content-Type"] = "text/html; charset=utf-8"
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["X-Robots-Tag"] = "noindex, nofollow"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'none'; script-src 'unsafe-inline'; "
+        "style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; "
+        "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    )
+    return resp
+
+
+@app.get("/api/owner/logs")
+@owner_required
+def owner_logs():
+    try:
+        days = min(90, max(1, int(request.args.get("days", 30))))
+    except ValueError:
+        days = 30
+    resp = jsonify(success=True, retention_days=iplog.RETENTION_DAYS, rows=iplog.read(days))
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 # ------------------------------------------------------------ تيليجرام
