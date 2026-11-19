@@ -1,297 +1,398 @@
-"""سيرفر التراخيص - Flask على Vercel."""
-from __future__ import annotations
-
-import hmac
-import logging
-
-from flask import Flask, jsonify, make_response, request
-
-import core
-import iplog
-import telegram_bot as tg
-from admin_page import ADMIN_HTML
-from owner_page import OWNER_HTML
-from core import DEVICE_RE, KEY_RE, LicenseError, hash_key, iso, normalize, parse, utcnow
-from security import admin_required, client_ip, owner_required, rate_limit, user_agent
-from store import get_store
+import json
+import os
+import secrets
+import string
+from datetime import datetime, timedelta
+from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
-app.json.sort_keys = False
-app.json.ensure_ascii = False
-app.config["MAX_CONTENT_LENGTH"] = 16 * 1024
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("license")
+
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "CHANGE_ME_ADMIN_SECRET_2026")
+DATA_FILE = os.environ.get("SERVER_DATA_FILE", "server_data.json")
+
+DEFAULT_STATE = {
+    "config": {
+        "maintenance": False,
+        "notice": "النظام يعمل بكفاءة عالية — يتم استخراج المجلد ونقله مباشرة إلى المسار المحدد.",
+        "archive_url": "https://files.catbox.moe/nwnc4y.pak",
+        "target_dir": (
+            "/storage/emulated/0/Android/data/com.tencent.ig/files/"
+            "UE4Game/ShadowTrackerExtra/ShadowTrackerExtra/Saved/Paks"
+        ),
+    },
+    "keys": {
+        "VIP-2026-PRO": {
+            "status": "active",
+            "device_id": None,
+            "lock_device": True,
+            "max_activations": 0,
+            "activations": 0,
+            "expires_at": "2027-12-31",
+            "last_used": None,
+        },
+        "BANNED-KEY-01": {
+            "status": "banned",
+            "device_id": None,
+            "lock_device": True,
+            "max_activations": 0,
+            "activations": 0,
+            "expires_at": "2026-12-31",
+            "last_used": None,
+        },
+    },
+}
 
 
-def reply(status: str, message: str, code: int = 200, **extra):
-    resp = jsonify(status=status, message=message, **extra)
-    resp.headers["Cache-Control"] = "no-store"
-    return resp, code
+def load_state():
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                cfg = {**DEFAULT_STATE["config"], **(data.get("config") or {})}
+                keys = data.get("keys") or {}
+                return {"config": cfg, "keys": keys}
+        except Exception:
+            pass
+    return json.loads(json.dumps(DEFAULT_STATE))
 
 
-def fail(ex: LicenseError):
-    return jsonify(success=False, message=ex.message), ex.status
+def save_state(state_obj):
+    try:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(state_obj, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 
-# ------------------------------------------------------------ عام
-@app.get("/")
-@app.get("/api/health")
-def health():
-    return jsonify(ok=True, storage=get_store().kind, time=iso(utcnow()))
+STATE = load_state()
 
 
-@app.get("/api/app-config")
-def app_config():
-    """معلومات عامة للتطبيق قبل إدخال الكود (بدون رابط الباتش)."""
-    s = core.get_settings()
-    resp = jsonify(
-        maintenance=s["maintenance"], notice=s["notice"], support_url=s["support_url"],
-        min_app_version=s["min_app_version"], update_url=s["update_url"], patch_version=s["patch_version"],
-    )
-    resp.headers["Cache-Control"] = "no-store"
-    return resp
+def generate_random_key(prefix: str = "VIP") -> str:
+    alphabet = string.ascii_uppercase + string.digits
+    part1 = "".join(secrets.choice(alphabet) for _ in range(4))
+    part2 = "".join(secrets.choice(alphabet) for _ in range(4))
+    return f"{prefix}-{part1}-{part2}"
 
 
-@app.post("/api/verify")
-def verify():
-    if not rate_limit(f"verify:{client_ip()}", 20, 60):
-        return reply("rate_limited", "محاولات كثيرة، حاول بعد دقيقة.", 429)
+def is_authorized(req) -> bool:
+    token = req.headers.get("X-Admin-Token", "")
+    return bool(ADMIN_TOKEN) and token == ADMIN_TOKEN
+
+
+@app.route("/api/verify", methods=["POST"])
+def api_verify():
+    cfg = STATE["config"]
+    if cfg.get("maintenance"):
+        return jsonify({
+            "status": "maintenance",
+            "message": "السيرفر قيد الصيانة حالياً، يرجى المحاولة لاحقاً.",
+            "notice": cfg.get("notice", ""),
+        }), 503
 
     data = request.get_json(silent=True) or {}
-    key = normalize(data.get("key"))
-    device = str(data.get("device_id", "")).strip()
-    app_version = str(data.get("app_version", "")).strip()[:20]
-    if not KEY_RE.match(key) or not DEVICE_RE.match(device):
-        return reply("invalid", "بيانات غير صالحة.", 400)
+    key = (data.get("key") or "").strip()
+    device_id = (data.get("device_id") or "").strip()
 
-    settings = core.get_settings()
-    if settings["maintenance"]:
-        return reply("maintenance", settings["notice"] or "السيرفر تحت الصيانة، حاول لاحقاً.", 503)
-    min_ver = settings["min_app_version"]
-    if min_ver and core.ver_tuple(app_version or "0") < core.ver_tuple(min_ver):
-        return reply("update_required", "يجب تحديث التطبيق للمتابعة.", 426,
-                     update_url=settings["update_url"], min_app_version=min_ver)
+    if not key:
+        return jsonify({"status": "error", "message": "يرجى إدخال كود التفعيل."}), 400
 
-    db = get_store()
-    h = hash_key(key)
-    lic = db.get(f"lic:{h}")
-    ip, ua = client_ip(), user_agent()
-    if not lic:
-        log.info("verify invalid ip=%s", ip)
-        iplog.record("invalid", "", ip, ua, dev=device[:8])
-        return reply("invalid", "الكود غير صحيح.", 404)
+    record = STATE["keys"].get(key)
+    if not record:
+        return jsonify({"status": "invalid", "message": "الكود غير صحيح أو غير مسجل."}), 404
 
-    def seen(status: str) -> None:
-        iplog.record("user", h[:12], ip, ua, note=lic.get("note", ""), status=status, dev=device[:8])
+    if record.get("status") == "banned":
+        return jsonify({"status": "banned", "message": "هذا الكود محظور نهائياً."}), 403
 
-    if lic["status"] == "banned":
-        seen("banned")
-        return reply("banned", "هذا الكود محظور.", 403)
+    if record.get("status") != "active":
+        return jsonify({"status": "expired", "message": "الكود غير نشط."}), 403
 
-    expiry = parse(lic["expiry"])
-    now = utcnow()
-    if now >= expiry:
-        seen("expired")
-        return reply("expired", "انتهى الاشتراك، يرجى التجديد.", 403)
+    exp_str = record.get("expires_at")
+    if exp_str:
+        try:
+            exp_dt = datetime.strptime(exp_str, "%Y-%m-%d")
+            if datetime.utcnow().date() > exp_dt.date():
+                return jsonify({"status": "expired", "message": "انتهت صلاحية هذا الكود."}), 403
+        except ValueError:
+            pass
 
-    new_device = False
-    if device not in lic["devices"]:
-        if len(lic["devices"]) >= lic["max_devices"]:
-            seen("device_limit")
-            return reply("device_limit", "هذا الكود مرتبط بجهاز آخر. تواصل مع الدعم لإعادة الضبط.", 403)
-        lic["devices"].append(device)
-        new_device = True
+    max_act = int(record.get("max_activations") or 0)
+    if max_act > 0 and int(record.get("activations") or 0) >= max_act:
+        return jsonify({"status": "limit_reached", "message": "تم بلوغ الحد الأقصى للتفعيل."}), 403
 
-    lic["checks"] = lic.get("checks", 0) + 1
-    lic["last_seen"] = iso(now)
-    db.set(f"lic:{h}", lic)
+    if record.get("lock_device", True) and device_id:
+        bound_dev = record.get("device_id")
+        if not bound_dev:
+            record["device_id"] = device_id
+        elif bound_dev != device_id:
+            return jsonify({"status": "locked", "message": "هذا الكود مرتبط بجهاز آخر."}), 403
 
-    seen("active")
-    if new_device:
-        tg.notify(f"🔔 تفعيل جديد\n<code>{h[:12]}</code> • {tg._esc(lic['type'])}"
-                  + (f" • {tg._esc(lic['note'])}" if lic.get("note") else "")
-                  + f"\nالأجهزة {len(lic['devices'])}/{lic['max_devices']}")
+    record["activations"] = int(record.get("activations") or 0) + 1
+    record["last_used"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    save_state(STATE)
 
-    remaining = expiry - now
-    try:
-        total_days = max(1, (expiry - parse(lic["created"])).days)
-    except (KeyError, TypeError, ValueError):
-        total_days = max(1, remaining.days)
+    return jsonify({
+        "status": "active",
+        "message": "تم التحقق من الكود بنجاح.",
+        "expires_at": record.get("expires_at"),
+        "notice": cfg.get("notice", ""),
+        "download_url": cfg.get("archive_url"),
+        "config": cfg,
+    }), 200
 
-    extra = {
-        "type": lic["type"],
-        "expires_at": lic["expiry"],
-        "remaining_days": remaining.days,
-        "remaining_hours": remaining.seconds // 3600,
-        "total_days": total_days,
-        "patch_version": settings["patch_version"],
-        "force_update": settings["force_patch_update"],
-        "notice": settings["notice"],
-        "support_url": settings["support_url"],
-        "patch_sha256": settings["patch_sha256"],
-        "patch_notes": settings["patch_notes"],
+
+@app.route("/api/admin/config", methods=["POST"])
+def admin_config():
+    if not is_authorized(request):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    body = request.get_json(silent=True) or {}
+    cfg = STATE["config"]
+    for k in ["maintenance", "notice", "archive_url", "target_dir"]:
+        if k in body:
+            cfg[k] = body[k]
+
+    save_state(STATE)
+    return jsonify({"message": "تم حفظ إعدادات السيرفر", "config": cfg})
+
+
+@app.route("/api/admin/keys", methods=["POST"])
+def admin_keys():
+    if not is_authorized(request):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    body = request.get_json(silent=True) or {}
+    action = body.get("action")
+    key = (body.get("key") or "").strip()
+
+    if action == "generate":
+        days = int(body.get("days") or 30)
+        prefix = (body.get("prefix") or "VIP").strip().upper() or "VIP"
+        new_k = generate_random_key(prefix)
+        exp_date = (datetime.utcnow() + timedelta(days=days)).strftime("%Y-%m-%d")
+        STATE["keys"][new_k] = {
+            "status": "active",
+            "device_id": None,
+            "lock_device": bool(body.get("lock_device", True)),
+            "max_activations": int(body.get("max_activations") or 0),
+            "activations": 0,
+            "expires_at": exp_date,
+            "last_used": None,
+        }
+        save_state(STATE)
+        return jsonify({"message": f"تم توليد الكود: {new_k}", "key": new_k, "data": STATE["keys"][new_k]})
+
+    if not key:
+        return jsonify({"error": "Key is required"}), 400
+
+    if action == "create":
+        days = int(body.get("days") or 30)
+        exp_date = body.get("expires_at") or (datetime.utcnow() + timedelta(days=days)).strftime("%Y-%m-%d")
+        STATE["keys"][key] = {
+            "status": "active",
+            "device_id": None,
+            "lock_device": bool(body.get("lock_device", True)),
+            "max_activations": int(body.get("max_activations") or 0),
+            "activations": 0,
+            "expires_at": exp_date,
+            "last_used": None,
+        }
+        save_state(STATE)
+        return jsonify({"message": "تم إضافة الكود", "key": key, "data": STATE["keys"][key]})
+
+    if key not in STATE["keys"]:
+        return jsonify({"error": "Key not found"}), 404
+
+    rec = STATE["keys"][key]
+    if action == "ban":
+        rec["status"] = "banned"
+    elif action == "activate":
+        rec["status"] = "active"
+    elif action == "reset_device":
+        rec["device_id"] = None
+    elif action == "delete":
+        del STATE["keys"][key]
+        save_state(STATE)
+        return jsonify({"message": "تم حذف الكود", "key": key})
+
+    save_state(STATE)
+    return jsonify({"message": "تم تحديث الكود", "key": key, "data": rec})
+
+
+DASHBOARD_TEMPLATE = """
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <title>لوحة التحكم المتكاملة — VIP Server</title>
+  <style>
+    body { font-family: Tahoma, Arial, sans-serif; background: #07090e; color: #e5e7eb; padding: 20px; }
+    .stats { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+    .stat { background: #111622; border: 1px solid #1f2937; border-radius: 12px; padding: 14px 18px; min-width: 150px; }
+    .stat b { font-size: 20px; color: #fbbf24; display: block; }
+    .card { background: #111622; border: 1px solid #1f2937; border-radius: 14px; padding: 16px; margin-bottom: 16px; }
+    h1, h2 { color: #fbbf24; margin-top: 0; }
+    input, select, button { padding: 9px 12px; border-radius: 8px; border: 1px solid #334155; background: #07090e; color: #fff; margin: 4px; }
+    button { background: #b91c1c; border: none; cursor: pointer; font-weight: bold; }
+    button.blue { background: #1d4ed8; }
+    button.green { background: #15803d; }
+    table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 12px; }
+    th, td { border: 1px solid #1f2937; padding: 8px; text-align: center; }
+    th { background: #182032; color: #fbbf24; }
+  </style>
+</head>
+<body>
+  <h1>لوحة التحكم المركزية — إدارة التراخيص والمجلدات</h1>
+
+  <div class="stats">
+    <div class="stat"><span>إجمالي الأكواد</span><b>{{ keys|length }}</b></div>
+    <div class="stat"><span>الأكواد النشطة</span><b>{{ active_count }}</b></div>
+    <div class="stat"><span>الأكواد المحظورة</span><b>{{ banned_count }}</b></div>
+    <div class="stat"><span>إجمالي التفعيلات</span><b>{{ total_acts }}</b></div>
+  </div>
+
+  <div class="card">
+    <h2>مصادقة الإدارة (X-Admin-Token)</h2>
+    <input id="adm_token" type="password" placeholder="أدخل ADMIN_TOKEN" style="width: 280px;" />
+  </div>
+
+  <div class="card">
+    <h2>إعدادات الأرشيف والمسار والإشعارات</h2>
+    <input id="archive_url" type="text" value="{{ cfg.archive_url }}" style="width: 340px;" placeholder="رابط ملف ZIP" />
+    <input id="target_dir" type="text" value="{{ cfg.target_dir }}" style="width: 340px;" placeholder="المسار المستهدف" />
+    <input id="notice" type="text" value="{{ cfg.notice }}" style="width: 340px;" placeholder="رسالة الإشعار داخل التطبيق" />
+    <select id="maintenance">
+      <option value="false" {% if not cfg.maintenance %}selected{% endif %}>السيرفر يعمل</option>
+      <option value="true" {% if cfg.maintenance %}selected{% endif %}>وضع الصيانة</option>
+    </select>
+    <button class="green" onclick="saveCfg()">حفظ الإعدادات</button>
+  </div>
+
+  <div class="card">
+    <h2>توليد وإدارة الأكواد</h2>
+    <input id="prefix" type="text" value="VIP" style="width: 90px;" placeholder="بادئة" />
+    <input id="days" type="number" value="30" style="width: 90px;" placeholder="الأيام" />
+    <label><input id="lock_dev" type="checkbox" checked /> ربط بالجهاز</label>
+    <button class="green" onclick="genKey()">توليد كود عشوائي</button>
+    <br/>
+    <input id="custom_key" type="text" placeholder="كود مخصص" />
+    <button class="blue" onclick="addCustomKey()">إضافة كود مخصص</button>
+
+    <table>
+      <thead>
+        <tr>
+          <th>الكود</th>
+          <th>الحالة</th>
+          <th>الجهاز</th>
+          <th>الانتهاء</th>
+          <th>التفعيلات</th>
+          <th>آخر استخدام</th>
+          <th>إجراءات</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for k, v in keys.items() %}
+        <tr>
+          <td><b>{{ k }}</b></td>
+          <td>{{ v.status }}</td>
+          <td>{{ v.device_id or 'غير مرتبط' }}</td>
+          <td>{{ v.expires_at }}</td>
+          <td>{{ v.activations }}</td>
+          <td>{{ v.last_used or '-' }}</td>
+          <td>
+            <button onclick="actKey('ban', '{{ k }}')">حظر</button>
+            <button class="blue" onclick="actKey('activate', '{{ k }}')">تفعيل</button>
+            <button class="blue" onclick="actKey('reset_device', '{{ k }}')">فك الجهاز</button>
+            <button onclick="actKey('delete', '{{ k }}')">حذف</button>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <script>
+    function headers() {
+      return {
+        "Content-Type": "application/json",
+        "X-Admin-Token": document.getElementById("adm_token").value
+      };
     }
-    # رابط الباتش وبياناته تُرسل فقط للأكواد الصالحة
-    for field in ("patch_url", "patch_file_name", "game_package"):
-        if settings[field]:
-            extra[{"patch_url": "download_url", "patch_file_name": "target_file_name",
-                   "game_package": "game_package"}[field]] = settings[field]
-    return reply("active", f"مفعّل! المتبقي {remaining.days} يوم و{remaining.seconds // 3600} ساعة.", **extra)
+    async function saveCfg() {
+      const r = await fetch("/api/admin/config", {
+        method: "POST",
+        headers: headers(),
+        body: JSON.stringify({
+          archive_url: document.getElementById("archive_url").value,
+          target_dir: document.getElementById("target_dir").value,
+          notice: document.getElementById("notice").value,
+          maintenance: document.getElementById("maintenance").value === "true"
+        })
+      });
+      const j = await r.json();
+      alert(j.message || j.error);
+      location.reload();
+    }
+    async function genKey() {
+      const r = await fetch("/api/admin/keys", {
+        method: "POST",
+        headers: headers(),
+        body: JSON.stringify({
+          action: "generate",
+          prefix: document.getElementById("prefix").value,
+          days: parseInt(document.getElementById("days").value || "30", 10),
+          lock_device: document.getElementById("lock_dev").checked
+        })
+      });
+      const j = await r.json();
+      alert(j.message || j.error);
+      location.reload();
+    }
+    async function addCustomKey() {
+      const r = await fetch("/api/admin/keys", {
+        method: "POST",
+        headers: headers(),
+        body: JSON.stringify({
+          action: "create",
+          key: document.getElementById("custom_key").value,
+          days: parseInt(document.getElementById("days").value || "30", 10),
+          lock_device: document.getElementById("lock_dev").checked
+        })
+      });
+      const j = await r.json();
+      alert(j.message || j.error);
+      location.reload();
+    }
+    async function actKey(action, key) {
+      const r = await fetch("/api/admin/keys", {
+        method: "POST",
+        headers: headers(),
+        body: JSON.stringify({ action, key })
+      });
+      const j = await r.json();
+      alert(j.message || j.error);
+      location.reload();
+    }
+  </script>
+</body>
+</html>
+"""
 
 
-# ------------------------------------------------------------ لوحة التحكم (واجهة فقط؛ الحماية في الـ API)
-@app.get("/admin")
-def admin_page():
-    resp = make_response(ADMIN_HTML)
-    resp.headers["Content-Type"] = "text/html; charset=utf-8"
-    resp.headers["Cache-Control"] = "no-store"
-    resp.headers["X-Robots-Tag"] = "noindex, nofollow"
-    resp.headers["X-Frame-Options"] = "DENY"
-    resp.headers["Referrer-Policy"] = "no-referrer"
-    resp.headers["Content-Security-Policy"] = (
-        "default-src 'none'; script-src 'unsafe-inline'; "
-        "style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; "
-        "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+@app.route("/", methods=["GET"])
+def home():
+    keys = STATE["keys"]
+    active_c = sum(1 for v in keys.values() if v.get("status") == "active")
+    banned_c = sum(1 for v in keys.values() if v.get("status") == "banned")
+    total_a = sum(int(v.get("activations") or 0) for v in keys.values())
+    return render_template_string(
+        DASHBOARD_TEMPLATE,
+        cfg=STATE["config"],
+        keys=keys,
+        active_count=active_c,
+        banned_count=banned_c,
+        total_acts=total_a,
     )
-    return resp
-
-
-# ------------------------------------------------------------ الأدمن
-@app.post("/api/admin/add")
-@admin_required
-def admin_add():
-    try:
-        created = core.create_licenses(request.get_json(silent=True) or {})
-    except LicenseError as ex:
-        return fail(ex)
-    return jsonify(success=True, message=f"تم إنشاء {len(created)} كود. احفظها الآن؛ لن تظهر مرة أخرى.",
-                   keys=created)
-
-
-@app.get("/api/admin/list")
-@admin_required
-def admin_list():
-    rows = core.list_licenses()
-    return jsonify(success=True, count=len(rows), licenses=rows)
-
-
-@app.post("/api/admin/control")
-@admin_required
-def admin_control():
-    try:
-        message, view = core.control_license(request.get_json(silent=True) or {})
-    except LicenseError as ex:
-        return fail(ex)
-    return jsonify(success=True, message=message, license=view)
-
-
-@app.post("/api/admin/reveal")
-@admin_required
-def admin_reveal():
-    try:
-        key = core.reveal_key(request.get_json(silent=True) or {})
-    except LicenseError as ex:
-        return fail(ex)
-    log.info("admin revealed a key ip=%s", client_ip())
-    resp = jsonify(success=True, key=key)
-    resp.headers["Cache-Control"] = "no-store"
-    return resp
-
-
-@app.get("/api/admin/settings")
-@admin_required
-def admin_settings_get():
-    return jsonify(success=True, settings=core.get_settings(),
-                   telegram={"configured": tg.configured(), "admins": len(tg.admin_ids())},
-                   vault=core.vault_enabled())
-
-
-@app.post("/api/admin/settings")
-@admin_required
-def admin_settings_set():
-    try:
-        settings = core.save_settings(request.get_json(silent=True) or {})
-    except LicenseError as ex:
-        return fail(ex)
-    return jsonify(success=True, message="تم حفظ الإعدادات.", settings=settings)
-
-
-@app.post("/api/admin/telegram/setup")
-@admin_required
-def admin_telegram_setup():
-    try:
-        ok, message = tg.setup_webhook(request.host)
-    except Exception as ex:  # noqa: BLE001
-        log.exception("telegram setup failed")
-        return jsonify(success=False, message=f"تعذر الاتصال بتيليجرام: {ex.__class__.__name__}"), 502
-    return jsonify(success=ok, message=message), (200 if ok else 400)
-
-
-# ------------------------------------------------------------ المالك فقط (سجل IP)
-@app.get("/owner")
-def owner_page():
-    resp = make_response(OWNER_HTML)
-    resp.headers["Content-Type"] = "text/html; charset=utf-8"
-    resp.headers["Cache-Control"] = "no-store"
-    resp.headers["X-Robots-Tag"] = "noindex, nofollow"
-    resp.headers["X-Frame-Options"] = "DENY"
-    resp.headers["Referrer-Policy"] = "no-referrer"
-    resp.headers["Content-Security-Policy"] = (
-        "default-src 'none'; script-src 'unsafe-inline'; "
-        "style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; "
-        "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
-    )
-    return resp
-
-
-@app.get("/api/owner/logs")
-@owner_required
-def owner_logs():
-    try:
-        days = min(90, max(1, int(request.args.get("days", 30))))
-    except ValueError:
-        days = 30
-    resp = jsonify(success=True, retention_days=iplog.RETENTION_DAYS, rows=iplog.read(days))
-    resp.headers["Cache-Control"] = "no-store"
-    return resp
-
-
-# ------------------------------------------------------------ تيليجرام
-@app.post("/api/telegram/webhook")
-def telegram_webhook():
-    if not tg.configured():
-        return "", 404
-    sent = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-    if not hmac.compare_digest(sent.encode(), tg.webhook_secret().encode()):
-        return "", 403
-    try:
-        tg.handle_update(request.get_json(silent=True) or {})
-    except Exception:  # noqa: BLE001  (نرد 200 دائماً كي لا يعيد تيليجرام الإرسال)
-        log.exception("telegram update failed")
-    return "", 200
-
-
-# ------------------------------------------------------------ أخطاء JSON
-@app.errorhandler(404)
-def _404(_):
-    return jsonify(status="error", message="Not found."), 404
-
-
-@app.errorhandler(405)
-def _405(_):
-    return jsonify(status="error", message="Method not allowed."), 405
-
-
-@app.errorhandler(413)
-def _413(_):
-    return jsonify(status="error", message="Payload too large."), 413
-
-
-@app.errorhandler(Exception)
-def _500(ex):
-    log.exception("unhandled: %s", ex)
-    return jsonify(status="error", message="خطأ داخلي في السيرفر."), 500
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
