@@ -1,4 +1,4 @@
-"""إدارة المشتركين عبر بوت تيليجرام (Webhook).
+"""إدارة المشتركين وOTA والتحديثات عبر بوت تيليجرام (Webhook).
 
 المتغيرات في Vercel:
   TELEGRAM_BOT_TOKEN : توكن البوت من @BotFather
@@ -23,30 +23,37 @@ log = logging.getLogger("telegram")
 ICONS = {"active": "🟢", "expired": "🟠", "banned": "🔴"}
 STATUS_AR = {"active": "نشط", "expired": "منتهي", "banned": "محظور"}
 
-HELP = """<b>أوامر الإدارة</b>
+HELP = """<b>أوامر إدارة Lader Tareiq</b>
 
 <b>الأكواد</b>
 /add month 3 أحمد  ← ينشئ 3 أكواد شهرية باسم «أحمد»
-  المدد: week | month | 2.5months | رقم أيام (مثل 45)
-/list  أو  /list active|expired|banned
+  المدد: day | week | month | 2.5months | year | رقم أيام
+/list  أو  /list active|expired|banned|soon
 /info ID
 /key ID  ← إظهار الكود الأصلي (للأكواد المحفوظة مشفّرة)
 /extend ID 30
+/bulkextend active 7  ← تمديد كل النشطة 7 أيام
 /reset ID  ← إعادة ضبط الجهاز
 /ban ID  ·  /unban ID
 /delete ID نعم
+/cleanup 30  ← حذف المنتهية منذ أكثر من 30 يوم
 /stats
 
-<b>الباتش والتطبيق</b>
+<b>الباتش وOTA والتطبيق</b>
 /settings  ← عرض الإعدادات الحالية
-/link https://…  ← رابط الباتش
+/link https://…  ← رابط الباتش أو الأرشيف
 /version 5  ← رقم الباتش (غيّره عند كل تحديث)
 /force on|off  ← تحديث الباتش الإلزامي
+/deploy auto|pak|folder  ← وضع النشر
+/ota 1.0.1  ← إصدار حزمة OTA التحسينية
+/otanotes نص  ← ملاحظات تحديث OTA
+/minver 2.0.0  ← أقل نسخة APK مسموحة (إلزامي)
+/latestver 2.1.0  ← أحدث نسخة APK (اختياري)
+/apkurl https://…  ← رابط تحميل APK الجديد
 /notice نص الإعلان  (أو /notice off)
 /maintenance on|off"""
 
 
-# ------------------------------------------------------------ إعدادات
 def token() -> str:
     return os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 
@@ -65,11 +72,9 @@ def configured() -> bool:
 
 
 def webhook_secret() -> str:
-    """سر الـ webhook مشتق من توكن البوت؛ لا حاجة لمتغير إضافي."""
     return hashlib.sha256(f"wh:{token()}".encode()).hexdigest()[:48]
 
 
-# ------------------------------------------------------------ Telegram API
 def call(method: str, **payload) -> dict:
     r = requests.post(f"https://api.telegram.org/bot{token()}/{method}", json=payload, timeout=5)
     try:
@@ -80,14 +85,18 @@ def call(method: str, **payload) -> dict:
 
 def send(chat_id: int, text: str) -> None:
     try:
-        call("sendMessage", chat_id=chat_id, text=text[:4000], parse_mode="HTML",
-             disable_web_page_preview=True)
+        call(
+            "sendMessage",
+            chat_id=chat_id,
+            text=text[:4000],
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
     except Exception:
         log.exception("telegram send failed")
 
 
 def notify(text: str) -> None:
-    """إشعار لكل المشرفين (يُتجاهل بصمت إن لم يُضبط البوت)."""
     if not configured():
         return
     for uid in admin_ids():
@@ -100,8 +109,13 @@ def setup_webhook(host: str) -> tuple[bool, str]:
     me = call("getMe")
     if not me.get("ok"):
         return False, "توكن البوت غير صحيح."
-    res = call("setWebhook", url=f"https://{host}/api/telegram/webhook", secret_token=webhook_secret(),
-               allowed_updates=["message"], drop_pending_updates=True)
+    res = call(
+        "setWebhook",
+        url=f"https://{host}/api/telegram/webhook",
+        secret_token=webhook_secret(),
+        allowed_updates=["message"],
+        drop_pending_updates=True,
+    )
     if not res.get("ok"):
         return False, res.get("description", "فشل ربط الـ webhook.")
     if not admin_ids():
@@ -109,7 +123,6 @@ def setup_webhook(host: str) -> tuple[bool, str]:
     return True, f"تم الربط مع @{me['result']['username']}"
 
 
-# ------------------------------------------------------------ مساعدات العرض
 def _esc(s: object) -> str:
     return html.escape(str(s), quote=False)
 
@@ -144,7 +157,6 @@ def _onoff(word: str) -> Optional[bool]:
     return None
 
 
-# ------------------------------------------------------------ الأوامر
 def cmd_add(args: list[str]) -> str:
     if not args:
         return "الاستخدام: /add month 3 أحمد"
@@ -165,13 +177,22 @@ def cmd_add(args: list[str]) -> str:
     if not created:
         return "لم يُنشأ أي كود، حاول مرة أخرى."
     keys = "\n".join(f"<code>{k['key']}</code>" for k in created)
-    return f"✅ تم إنشاء {len(created)} كود (ينتهي {created[0]['expires_at'][:10]})\n\n{keys}\n\nاحفظها الآن؛ لن تظهر مرة أخرى."
+    return (
+        f"✅ تم إنشاء {len(created)} كود (ينتهي {created[0]['expires_at'][:10]})\n\n"
+        f"{keys}\n\nاحفظها الآن؛ لن تظهر مرة أخرى."
+    )
 
 
 def cmd_list(args: list[str]) -> str:
-    rows = sorted(core.list_licenses(), key=lambda r: r.get("created") or "", reverse=True)
-    if args and args[0].lower() in STATUS_AR:
-        rows = [r for r in rows if r["status"] == args[0].lower()]
+    status = ""
+    soon = False
+    if args:
+        a0 = args[0].lower()
+        if a0 == "soon":
+            soon = True
+        elif a0 in STATUS_AR:
+            status = a0
+    rows = core.list_licenses(status=status, soon_only=soon)
     if not rows:
         return "لا توجد أكواد."
     body = "\n".join(_line(r) for r in rows[:25])
@@ -186,9 +207,11 @@ def cmd_info(args: list[str]) -> str:
     if not r:
         return "الترخيص غير موجود."
     seen = r["last_seen"].replace("T", " ")[:16] if r.get("last_seen") else "—"
-    return (f"{_line(r)}\n"
-            f"ينتهي: {r['expires_at'][:10]}\nالأجهزة: {r['devices']}/{r['max_devices']}\n"
-            f"عدد التحققات: {r['checks']}\nآخر ظهور: {seen}")
+    return (
+        f"{_line(r)}\n"
+        f"ينتهي: {r['expires_at'][:10]}\nالأجهزة: {r['devices']}/{r['max_devices']}\n"
+        f"عدد التحققات: {r['checks']}\nآخر ظهور: {seen}"
+    )
 
 
 def cmd_key(args: list[str]) -> str:
@@ -198,15 +221,30 @@ def cmd_key(args: list[str]) -> str:
 
 
 def cmd_stats(_: list[str]) -> str:
-    rows = core.list_licenses()
-    c = {"active": 0, "expired": 0, "banned": 0}
-    soon = 0
-    for r in rows:
-        c[r["status"]] = c.get(r["status"], 0) + 1
-        if r["status"] == "active" and (core.parse(r["expires_at"]) - core.utcnow()).days < 3:
-            soon += 1
-    return (f"📊 <b>الإحصائيات</b>\nالكل: {len(rows)}\n🟢 نشط: {c['active']}\n"
-            f"🟠 منتهي: {c['expired']}\n🔴 محظور: {c['banned']}\n⏳ ينتهي خلال 3 أيام: {soon}")
+    c = core.license_stats()
+    return (
+        f"📊 <b>الإحصائيات</b>\nالكل: {c['total']}\n🟢 نشط: {c['active']}\n"
+        f"🟠 منتهي: {c['expired']}\n🔴 محظور: {c['banned']}\n"
+        f"⏳ ينتهي خلال 3 أيام: {c['soon']}\n🔎 إجمالي التحققات: {c['checks']}"
+    )
+
+
+def cmd_bulk_extend(args: list[str]) -> str:
+    if len(args) < 2 or not args[1].isdigit():
+        return "الاستخدام: /bulkextend active|expired|banned 7"
+    status, days = args[0].lower(), int(args[1])
+    if status not in STATUS_AR:
+        return "الحالة: active | expired | banned"
+    result = core.bulk_extend({"status": status, "days": days})
+    return f"✅ تم تمديد {result['extended']} كود بـ {result['days']} يوم" + (
+        f" (فشل {result['failed']})" if result["failed"] else ""
+    )
+
+
+def cmd_cleanup(args: list[str]) -> str:
+    days = int(args[0]) if args and args[0].isdigit() else 30
+    removed = core.cleanup_expired(days)
+    return f"🧹 تم حذف {removed} ترخيص منتهٍ منذ أكثر من {days} يوم."
 
 
 def cmd_control(action: str, args: list[str]) -> str:
@@ -227,11 +265,14 @@ def cmd_settings(_: list[str]) -> str:
     s = core.get_settings()
     yn = lambda b: "مفعّل" if b else "متوقف"  # noqa: E731
     return (
-        "<b>الإعدادات الحالية</b>\n"
+        "<b>الإعدادات الحالية — Lader Tareiq</b>\n"
         f"رابط الباتش: {_esc(s['patch_url']) or '❌ غير مضبوط'}\n"
-        f"رقم الباتش: {_esc(s['patch_version'])}\nتحديث إلزامي: {yn(s['force_patch_update'])}\n"
-        f"إعلان: {_esc(s['notice']) or '—'}\nالصيانة: {yn(s['maintenance'])}\n"
-        f"أقل نسخة تطبيق: {_esc(s['min_app_version']) or '—'}"
+        f"رقم الباتش: {_esc(s['patch_version'])}\n"
+        f"إصدار OTA: {_esc(s['ota_version'])}\n"
+        f"تحديث إلزامي: {yn(s['force_patch_update'])}\n"
+        f"إعلان: {_esc(s['notice']) or '—'}\n"
+        f"الصيانة: {yn(s['maintenance'])}\n"
+        f"أقل نسخة APK: {_esc(s['min_app_version']) or '—'} | الأحدث: {_esc(s['latest_app_version']) or '—'}"
     )
 
 
@@ -257,17 +298,32 @@ def run_command(text: str) -> str:
     cmd = parts[0].lstrip("/").split("@")[0].lower()
     args = parts[1:]
     table = {
-        "add": lambda: cmd_add(args), "list": lambda: cmd_list(args), "info": lambda: cmd_info(args), "key": lambda: cmd_key(args),
-        "stats": lambda: cmd_stats(args), "settings": lambda: cmd_settings(args),
-        "ban": lambda: cmd_control("ban", args), "unban": lambda: cmd_control("unban", args),
-        "reset": lambda: cmd_control("reset_devices", args), "extend": lambda: cmd_control("extend", args),
+        "add": lambda: cmd_add(args),
+        "list": lambda: cmd_list(args),
+        "info": lambda: cmd_info(args),
+        "key": lambda: cmd_key(args),
+        "stats": lambda: cmd_stats(args),
+        "settings": lambda: cmd_settings(args),
+        "ban": lambda: cmd_control("ban", args),
+        "unban": lambda: cmd_control("unban", args),
+        "reset": lambda: cmd_control("reset_devices", args),
+        "extend": lambda: cmd_control("extend", args),
         "delete": lambda: cmd_control("delete", args),
+        "bulkextend": lambda: cmd_bulk_extend(args),
+        "cleanup": lambda: cmd_cleanup(args),
         "link": lambda: cmd_set("patch_url", args, "رابط الباتش"),
         "version": lambda: cmd_set("patch_version", args, "رقم الباتش"),
         "force": lambda: cmd_set("force_patch_update", args, "التحديث الإلزامي"),
         "notice": lambda: cmd_set("notice", args, "الإعلان"),
         "maintenance": lambda: cmd_set("maintenance", args, "وضع الصيانة"),
-        "start": lambda: HELP, "help": lambda: HELP,
+        "deploy": lambda: cmd_set("deploy_mode", args, "وضع النشر"),
+        "ota": lambda: cmd_set("ota_version", args, "إصدار OTA"),
+        "otanotes": lambda: cmd_set("ota_notes", args, "ملاحظات OTA"),
+        "minver": lambda: cmd_set("min_app_version", args, "أقل نسخة APK"),
+        "latestver": lambda: cmd_set("latest_app_version", args, "أحدث نسخة APK"),
+        "apkurl": lambda: cmd_set("update_url", args, "رابط APK الجديد"),
+        "start": lambda: HELP,
+        "help": lambda: HELP,
     }
     handler = table.get(cmd)
     if handler is None:
