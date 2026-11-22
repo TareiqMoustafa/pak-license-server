@@ -11,20 +11,20 @@ OWNER_HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="robots" content="noindex, nofollow">
-<meta name="theme-color" content="#06080f">
-<title>سجل الدخول</title>
+<meta name="theme-color" content="#05070E">
+<title>Lader Tareiq — سجل الدخول</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800&family=Orbitron:wght@600;800&display=swap">
 <style>""" + _CSS + r"""
 .wrap{max-width:1100px}
-.tbl-wrap{overflow-x:auto;border:1px solid var(--rule);border-radius:var(--r);background:var(--plate)}
+.tbl-wrap{overflow-x:auto;border:1px solid var(--rule);border-radius:16px;background:linear-gradient(160deg,var(--plate2),var(--plate))}
 table{width:100%;border-collapse:collapse;font-size:13.5px;min-width:760px}
 th,td{padding:9px 12px;text-align:start;white-space:nowrap}
 th{position:sticky;top:0;background:var(--plate2);color:var(--mut);font-weight:700;font-size:12.5px;border-bottom:1px solid var(--rule)}
-tr.day td{background:#0a0f20;color:var(--cyan);font-weight:800;border-top:1px solid #19e3ff33;font-family:"Orbitron","Tajawal",sans-serif;font-size:13px}
-tr.r td{border-top:1px solid #121a33}
-tr.r:hover td{background:#19e3ff0a}
+tr.day td{background:#0b1024;color:var(--cyan);font-weight:800;border-top:1px solid #19e3ff33;font-family:"Orbitron","Tajawal",sans-serif;font-size:13px}
+tr.r td{border-top:1px solid #131c38}
+tr.r:hover td{background:#19e3ff0c}
 td.ip{font-family:ui-monospace,Menlo,Consolas,monospace;direction:ltr;text-align:start;color:var(--cyan)}
 td.ua{max-width:240px;overflow:hidden;text-overflow:ellipsis;color:var(--mut);direction:ltr;text-align:start}
 .k{font-size:12px;font-weight:700;padding:1px 9px;border-radius:99px;border:1px solid currentColor}
@@ -38,8 +38,8 @@ td.ua{max-width:240px;overflow:hidden;text-overflow:ellipsis;color:var(--mut);di
 <section id="login" class="login">
   <div class="login-box">
     <svg class="mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"><path d="M12 2.5l8 3v6c0 5-3.4 9.2-8 10.5-4.6-1.3-8-5.5-8-10.5v-6z"/><circle cx="12" cy="11" r="2.2"/></svg>
-    <h1>سجل الدخول</h1>
-    <p class="mut">توكن المالك فقط.</p>
+    <h1>Lader Tareiq</h1>
+    <p class="mut">سجل الدخول — توكن المالك فقط.</p>
     <label for="tk">التوكن</label>
     <input id="tk" type="password" class="ltr" autocomplete="off" autocapitalize="off" spellcheck="false">
     <button id="go" class="btn-main btn-block" style="margin-top:16px">دخول</button>
@@ -49,7 +49,7 @@ td.ua{max-width:240px;overflow:hidden;text-overflow:ellipsis;color:var(--mut);di
 
 <div id="app" class="hide">
   <header class="bar"><div class="bar-in">
-    <div class="brand"><div><b>سجل الدخول</b><small id="meta">…</small></div></div>
+    <div class="brand"><div><b>Lader Tareiq • سجل الدخول</b><small id="meta">…</small></div></div>
     <button id="out" class="btn-ghost btn-sm">خروج</button>
   </div></header>
   <main class="wrap">
@@ -102,7 +102,6 @@ function view(){
 }
 function render(){
   const v=view();
-  // كود ظهر من 3 عناوين فأكثر في أيام مختلفة أو نفس اليوم (مؤشر مشاركة الكود)
   const per={};rows.filter(r=>r.kind==='user').forEach(r=>{(per[r.who]=per[r.who]||new Set()).add(r.ip);});
   const flagged=new Set(Object.keys(per).filter(k=>per[k].size>=3));
   $('#sRows').textContent=v.length;$('#sIps').textContent=new Set(v.map(r=>r.ip)).size;
