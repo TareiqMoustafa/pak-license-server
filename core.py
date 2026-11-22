@@ -1,8 +1,9 @@
-"""منطق التراخيص والإعدادات (يستخدمه الـ API وبوت تيليجرام معاً)."""
+"""منطق التراخيص والإعدادات وOTA (يستخدمه الـ API وبوت تيليجرام معاً)."""
 from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 import re
 import secrets
@@ -11,12 +12,12 @@ from typing import Optional
 
 from store import get_store
 
-DURATIONS = {"week": 7, "month": 30, "2.5months": 75}
+DURATIONS = {"week": 7, "month": 30, "2.5months": 75, "year": 365, "day": 1}
 KEY_RE = re.compile(r"^[A-Z0-9][A-Z0-9_-]{5,63}$")
 DEVICE_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 INDEX = "licenses"
-ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # بدون أحرف متشابهة (0/O, 1/I)
-ACTIONS = {"ban", "unban", "reset_devices", "extend", "delete"}
+ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+ACTIONS = {"ban", "unban", "reset_devices", "extend", "delete", "set_note", "set_max_devices"}
 
 
 class LicenseError(Exception):
@@ -26,7 +27,6 @@ class LicenseError(Exception):
         self.status = status
 
 
-# ------------------------------------------------------------ أدوات
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -71,26 +71,29 @@ def find_hash(data: dict) -> Optional[str]:
 
 
 def public_view(h: str, lic: dict) -> dict:
-    expired = parse(lic["expiry"]) <= utcnow()
+    now = utcnow()
+    expiry = parse(lic["expiry"])
+    expired = expiry <= now
+    remaining = max(0, (expiry - now).days) if not expired else 0
+    status = "expired" if expired and lic["status"] == "active" else lic["status"]
     return {
         "id": h[:12],
         "type": lic["type"],
-        "status": "expired" if expired and lic["status"] == "active" else lic["status"],
+        "status": status,
         "expires_at": lic["expiry"],
         "created": lic.get("created"),
-        "devices": len(lic["devices"]),
-        "max_devices": lic["max_devices"],
+        "devices": len(lic.get("devices") or []),
+        "max_devices": lic.get("max_devices", 1),
         "checks": lic.get("checks", 0),
         "last_seen": lic.get("last_seen"),
         "note": lic.get("note", ""),
         "recoverable": bool(lic.get("enc")),
+        "remaining_days": remaining,
+        "soon": status == "active" and remaining <= 3,
     }
 
 
-
-# ------------------------------------------------------------ حفظ مشفّر للأكواد (اختياري)
 def _fernet():
-    """يعمل فقط إذا ضُبط KEY_VAULT_SECRET في Vercel (24 حرفاً فأكثر)؛ وإلا لا يُحفظ أي شيء قابل للاسترجاع."""
     secret = os.environ.get("KEY_VAULT_SECRET", "")
     if len(secret) < 24:
         return None
@@ -117,7 +120,7 @@ def reveal_key(data: dict) -> str:
     except Exception:
         raise LicenseError("تعذر فك التشفير (هل تغيّر KEY_VAULT_SECRET؟).", 500)
 
-# ------------------------------------------------------------ التراخيص
+
 def create_licenses(data: dict) -> list[dict]:
     dtype = str(data.get("type", "week"))
     days = DURATIONS.get(dtype)
@@ -155,9 +158,15 @@ def create_licenses(data: dict) -> list[dict]:
                 raise LicenseError("هذا الكود موجود مسبقاً.", 409)
             continue
         record = {
-            "type": dtype, "status": "active", "expiry": expiry, "created": iso(now),
-            "devices": [], "max_devices": max_devices, "checks": 0,
-            "last_seen": None, "note": str(data.get("note", ""))[:100],
+            "type": dtype,
+            "status": "active",
+            "expiry": expiry,
+            "created": iso(now),
+            "devices": [],
+            "max_devices": max_devices,
+            "checks": 0,
+            "last_seen": None,
+            "note": str(data.get("note", ""))[:100],
         }
         if vault:
             record["enc"] = vault.encrypt(key.encode()).decode()
@@ -167,21 +176,53 @@ def create_licenses(data: dict) -> list[dict]:
     return created
 
 
-def list_licenses(limit: int = 500) -> list[dict]:
+def list_licenses(
+    limit: int = 500,
+    *,
+    status: str = "",
+    q: str = "",
+    soon_only: bool = False,
+) -> list[dict]:
     db = get_store()
-    hashes = db.smembers(INDEX)[:limit]
-    rows = []
+    hashes = db.smembers(INDEX)
+    rows: list[dict] = []
+    q_norm = (q or "").strip().lower()
+    status_norm = (status or "").strip().lower()
     for h, lic in zip(hashes, db.mget([f"lic:{h}" for h in hashes])):
-        if lic:
-            rows.append(public_view(h, lic))
-    return rows
+        if not lic:
+            continue
+        view = public_view(h, lic)
+        if status_norm and view["status"] != status_norm:
+            continue
+        if soon_only and not view.get("soon"):
+            continue
+        if q_norm:
+            hay = f"{view['id']} {view.get('note', '')} {view.get('type', '')}".lower()
+            if q_norm not in hay:
+                continue
+        rows.append(view)
+    rows.sort(key=lambda r: r.get("created") or "", reverse=True)
+    return rows[: max(1, min(limit, 2000))]
+
+
+def license_stats() -> dict:
+    rows = list_licenses(limit=2000)
+    counts = {"active": 0, "expired": 0, "banned": 0, "total": len(rows), "soon": 0, "checks": 0}
+    for r in rows:
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+        counts["checks"] += int(r.get("checks") or 0)
+        if r.get("soon"):
+            counts["soon"] += 1
+    return counts
 
 
 def control_license(data: dict) -> tuple[str, Optional[dict]]:
     action = str(data.get("action", "")).lower()
     action = {"block": "ban", "unblock": "unban"}.get(action, action)
     if action not in ACTIONS:
-        raise LicenseError("action: ban | unban | reset_devices | extend | delete")
+        raise LicenseError(
+            "action: ban | unban | reset_devices | extend | delete | set_note | set_max_devices"
+        )
 
     h = find_hash(data)
     db = get_store()
@@ -207,34 +248,103 @@ def control_license(data: dict) -> tuple[str, Optional[dict]]:
             days = 0
         if not 1 <= days <= 3650:
             raise LicenseError("days (1-3650).")
-        base = max(parse(lic["expiry"]), utcnow())  # التمديد من الآن إن كان منتهياً
+        base = max(parse(lic["expiry"]), utcnow())
         lic["expiry"] = iso(base + timedelta(days=days))
+    elif action == "set_note":
+        lic["note"] = str(data.get("note", ""))[:100]
+    elif action == "set_max_devices":
+        try:
+            md = int(data.get("max_devices", 1))
+        except (TypeError, ValueError):
+            md = 0
+        if not 1 <= md <= 10:
+            raise LicenseError("max_devices (1-10).")
+        lic["max_devices"] = md
 
     db.set(f"lic:{h}", lic)
     return f"تم تنفيذ {action}.", public_view(h, lic)
 
 
-# ------------------------------------------------------------ إعدادات الباتش والتطبيق
+def cleanup_expired(older_than_days: int = 30) -> int:
+    if not 1 <= older_than_days <= 3650:
+        raise LicenseError("older_than_days (1-3650).")
+    db = get_store()
+    cutoff = utcnow() - timedelta(days=older_than_days)
+    removed = 0
+    hashes = db.smembers(INDEX)
+    for h, lic in zip(hashes, db.mget([f"lic:{h}" for h in hashes])):
+        if not lic:
+            db.srem(INDEX, h)
+            continue
+        try:
+            exp = parse(lic["expiry"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if exp < cutoff and lic.get("status") != "banned":
+            db.delete(f"lic:{h}")
+            db.srem(INDEX, h)
+            removed += 1
+    return removed
+
+
+def bulk_extend(data: dict) -> dict:
+    try:
+        days = int(data.get("days", 0))
+    except (TypeError, ValueError):
+        days = 0
+    if not 1 <= days <= 3650:
+        raise LicenseError("days (1-3650).")
+    ids = data.get("ids") or []
+    if isinstance(ids, str):
+        ids = [x.strip() for x in ids.replace(",", " ").split() if x.strip()]
+    status_filter = str(data.get("status", "")).lower().strip()
+    rows = list_licenses(limit=2000)
+    targets = []
+    if ids:
+        id_set = {i.lower() for i in ids}
+        targets = [r for r in rows if r["id"] in id_set or any(r["id"].startswith(i) for i in id_set)]
+    elif status_filter in ("active", "expired", "banned"):
+        targets = [r for r in rows if r["status"] == status_filter]
+    else:
+        raise LicenseError("حدد ids أو status (active|expired|banned).")
+    ok, fail = 0, 0
+    for r in targets[:200]:
+        try:
+            control_license({"id": r["id"], "action": "extend", "days": days})
+            ok += 1
+        except LicenseError:
+            fail += 1
+    return {"extended": ok, "failed": fail, "days": days}
+
+
+# ------------------------------------------------------------ إعدادات الباتش والتطبيق وOTA
 SETTINGS_KEY = "settings"
-FILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{2,100}\.pak$")
+FILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{2,100}\.(pak|zip)$", re.IGNORECASE)
 PKG_RE = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z0-9_]+)+$")
 VERSION_RE = re.compile(r"^[A-Za-z0-9._-]{0,32}$")
 APPVER_RE = re.compile(r"^\d+(\.\d+){0,3}$")
 URL_RE = re.compile(r"^https?://[^\s]{4,500}$")
 
 DEFAULTS: dict = {
-    "patch_url": "",             # رابط تحميل الباتش (يُرسل للتطبيق بعد التحقق من الكود فقط)
-    "patch_file_name": "",       # اسم الملف داخل مجلد اللعبة (.pak)
-    "game_package": "",          # حزمة اللعبة (مثل com.tencent.ig)
-    "patch_version": "1",        # غيّر الرقم عند كل باتش جديد ليعرف التطبيق أن هناك تحديثاً
-    "patch_sha256": "",          # بصمة SHA-256 للملف (اختياري) ليتحقق التطبيق من سلامته
-    "patch_notes": "",           # ما الجديد في هذا الباتش (يظهر في التطبيق)
-    "force_patch_update": False,  # تحديث الباتش تلقائياً وإلزامياً
-    "min_app_version": "",       # أقل نسخة تطبيق مسموحة (أي نسخة أقدم تُمنع وتُطلب منها التحديث)
-    "update_url": "",            # رابط تحميل APK الجديد
-    "notice": "",                # إعلان يظهر في أعلى التطبيق
-    "support_url": "",           # رابط الدعم (تيليجرام/واتساب)
-    "maintenance": False,        # إيقاف التحقق مؤقتاً
+    "patch_url": "",
+    "patch_file_name": "",
+    "game_package": "",
+    "patch_version": "1",
+    "patch_sha256": "",
+    "patch_notes": "",
+    "deploy_mode": "auto",
+    "force_patch_update": False,
+    "min_app_version": "",
+    "latest_app_version": "",
+    "update_url": "",
+    "update_message": "",
+    "ota_version": "1.0.0",
+    "ota_notes": "",
+    "ota_activate_label": "",
+    "ota_install_label": "",
+    "notice": "",
+    "support_url": "",
+    "maintenance": False,
 }
 ENV_FALLBACK = {"patch_url": "PATCH_URL", "patch_file_name": "PATCH_FILE_NAME", "game_package": "GAME_PACKAGE"}
 BOOL_FIELDS = {"force_patch_update", "maintenance"}
@@ -248,7 +358,6 @@ def get_stored_settings() -> dict:
 
 
 def get_settings() -> dict:
-    """القيمة المحفوظة من اللوحة أولاً، ثم متغيرات Vercel (PATCH_URL...)، ثم الافتراضي."""
     out = dict(DEFAULTS)
     for field, env in ENV_FALLBACK.items():
         out[field] = os.environ.get(env, "").strip()
@@ -257,6 +366,34 @@ def get_settings() -> dict:
         if field in DEFAULTS and value not in ("", None):
             out[field] = value
     return out
+
+
+def build_ota_bundle() -> dict:
+    s = get_settings()
+    payload: dict = {}
+    if s.get("ota_notes"):
+        payload["notes"] = s["ota_notes"]
+    if s.get("notice"):
+        payload["notice"] = s["notice"]
+    if s.get("support_url"):
+        payload["support_url"] = s["support_url"]
+    if s.get("ota_activate_label"):
+        payload["activate_label"] = s["ota_activate_label"]
+    if s.get("ota_install_label"):
+        payload["install_label"] = s["ota_install_label"]
+
+    canonical = json.dumps(
+        payload,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest = hashlib.sha256(canonical).hexdigest()
+    return {
+        "ota_version": s.get("ota_version") or "1.0.0",
+        "payload": payload,
+        "sha256": digest,
+    }
 
 
 def validate_settings(data: dict) -> dict:
@@ -273,19 +410,25 @@ def validate_settings(data: dict) -> dict:
             if value and not URL_RE.match(value):
                 raise LicenseError("الرابط يجب أن يبدأ بـ http:// أو https://")
         elif field == "patch_file_name" and value and not FILE_RE.match(value):
-            raise LicenseError("اسم الملف يجب أن ينتهي بـ .pak ويحتوي أحرفاً إنجليزية وأرقاماً فقط.")
+            raise LicenseError("اسم الملف يجب أن ينتهي بـ .pak أو .zip ويحتوي أحرفاً إنجليزية وأرقاماً فقط.")
         elif field == "game_package" and value and not PKG_RE.match(value):
             raise LicenseError("حزمة اللعبة غير صحيحة (مثال: com.tencent.ig).")
-        elif field == "patch_version" and not VERSION_RE.match(value):
-            raise LicenseError("رقم الباتش: أحرف وأرقام ونقطة وشرطة فقط (حتى 32).")
-        elif field == "min_app_version" and value and not APPVER_RE.match(value):
-            raise LicenseError("نسخة التطبيق بالشكل 1.3.0")
-        elif field == "notice" and len(value) > 300:
-            raise LicenseError("الإعلان أطول من 300 حرف.")
+        elif field in ("patch_version", "ota_version") and value and not VERSION_RE.match(value):
+            raise LicenseError("رقم الإصدار: أحرف وأرقام ونقطة وشرطة فقط (حتى 32).")
+        elif field in ("min_app_version", "latest_app_version") and value and not APPVER_RE.match(value):
+            raise LicenseError("نسخة التطبيق بالشكل 2.1.0")
+        elif field in ("notice", "update_message", "ota_notes") and len(value) > 400:
+            raise LicenseError("النص أطول من 400 حرف.")
+        elif field in ("ota_activate_label", "ota_install_label") and len(value) > 40:
+            raise LicenseError("نص الزر أطول من 40 حرفاً.")
         elif field == "patch_notes" and len(value) > 600:
             raise LicenseError("ملاحظات الباتش أطول من 600 حرف.")
         elif field == "patch_sha256" and value and not re.fullmatch(r"[A-Fa-f0-9]{64}", value):
             raise LicenseError("بصمة SHA-256 يجب أن تكون 64 خانة (0-9 و a-f).")
+        elif field == "deploy_mode":
+            value = value.lower() if value else "auto"
+            if value not in ("auto", "pak", "folder"):
+                raise LicenseError("deploy_mode: auto | pak | folder")
         clean[field] = value
     return clean
 
